@@ -163,7 +163,7 @@ def cached_viewfinder_template():
 # 6) Streamlit UI
 # =========================================================
 st.set_page_config(page_title="シマノ クランク判定", layout="wide")
-st.title("シマノ クランク 自動特定システム")
+st.title("特定製品 自動特定システム")
 st.caption("対応モデル：FCR7100 / FCR8100 / FCR9200 ｜ CNN + 刻印OCR 融合判定")
 
 # --- サイドバー：モデル設定 ---
