@@ -10,10 +10,10 @@
 - アップロード直後に画像を縮小してメモリピークを下げる
 - モデルをCPU固定オプションを追加（Cloudで安全）
 - use_container_width 警告に対応（width='stretch' に置換）
+- ocr_engine 側が target= 未対応でも落ちないようにフォールバック
 """
 
 import io
-import os
 import zipfile
 import tempfile
 from pathlib import Path
@@ -49,9 +49,9 @@ NUM_CLASSES = len(CLASS_NAMES)
 
 # =========================================================
 # 安定化：画像の最大辺を制限（メモリピーク対策）
-# ※ 1MBでも高解像度なことがあるため「解像度」で制御する
 # =========================================================
 DEFAULT_MAX_SIDE = 1024  # Cloudでの安定性を優先（必要なら 768 に下げる）
+
 
 def shrink_max_side(im: Image.Image, max_side: int = DEFAULT_MAX_SIDE) -> Image.Image:
     """縦横の最大辺が max_side を超える場合に縮小（アスペクト維持）"""
@@ -62,6 +62,7 @@ def shrink_max_side(im: Image.Image, max_side: int = DEFAULT_MAX_SIDE) -> Image.
     scale = max_side / m
     new_w, new_h = int(w * scale), int(h * scale)
     return im.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
 
 # =========================================================
 # 2) 前処理（学習時の val_tf と同じ設定）
@@ -77,6 +78,7 @@ DEFAULT_TRANSFORM = transforms.Compose([
     ),
 ])
 
+
 # =========================================================
 # 3) ユーティリティ関数
 # =========================================================
@@ -85,6 +87,7 @@ def device_str(force_cpu: bool = True) -> str:
     if force_cpu:
         return "cpu"
     return "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def pil_open_rgb(file_bytes: bytes, max_side: int = DEFAULT_MAX_SIDE) -> Image.Image:
     """バイト列から PIL Image (RGB) を生成。EXIF回転も自動補正。さらに縮小。"""
@@ -100,14 +103,16 @@ def pil_open_rgb(file_bytes: bytes, max_side: int = DEFAULT_MAX_SIDE) -> Image.I
     im = shrink_max_side(im, max_side=max_side)
     return im
 
+
 def list_images_in_zip(zf: zipfile.ZipFile) -> List[zipfile.ZipInfo]:
     """ZIP内の画像ファイル一覧を返す。"""
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
     return [
         info for info in zf.infolist()
-        if not info.is_dir()
+        if (not info.is_dir())
         and Path(info.filename).suffix.lower() in exts
     ]
+
 
 # =========================================================
 # 4) 推論関数
@@ -129,9 +134,9 @@ def predict_batch(
         raise RuntimeError(f"logits.shape が不正: {tuple(out.shape)}（期待 [N, C]）")
     return out.detach().cpu()
 
+
 # =========================================================
 # 5) モデル読込（キャッシュ付き）
-#    安定化：device込みでキャッシュ（CPU→GPUコピーの二重保持を避ける）
 # =========================================================
 @st.cache_resource(show_spinner="モデルを読み込んでいます...")
 def load_model(model_path: str, num_classes: int, device: str) -> torch.nn.Module:
@@ -144,7 +149,6 @@ def load_model(model_path: str, num_classes: int, device: str) -> torch.nn.Modul
 
     ckpt = torch.load(model_path, map_location="cpu")
 
-    # class_names の整合チェック
     saved_classes = ckpt.get("class_names")
     if saved_classes and saved_classes != CLASS_NAMES:
         st.warning(
@@ -152,13 +156,11 @@ def load_model(model_path: str, num_classes: int, device: str) -> torch.nn.Modul
             f"アプリ定義 {CLASS_NAMES} が異なります。結果が不正確になる可能性があります。"
         )
 
-    state_dict = ckpt.get("state_dict") or ckpt  # state_dict キーがない場合も考慮
+    state_dict = ckpt.get("state_dict") or ckpt
 
-    # ResNet-50 ベースモデルを構築
     backbone = models.resnet50(weights=None)
     backbone.fc = torch.nn.Linear(backbone.fc.in_features, num_classes)
 
-    # "model." / "module." プレフィックスを除去して読み込む
     new_sd = {}
     for k, v in state_dict.items():
         nk = k
@@ -173,15 +175,17 @@ def load_model(model_path: str, num_classes: int, device: str) -> torch.nn.Modul
     backbone = backbone.to(device)
     return backbone
 
-# OCR Reader のロードは “必要時のみ” にする（落ちやすいので自動ロードしない）
+
 @st.cache_resource(show_spinner="OCRエンジンを初期化しています（初回はモデルDL）...")
 def load_ocr_reader():
     from ocr_engine import get_ocr_reader
     return get_ocr_reader()
 
+
 @st.cache_data
 def cached_viewfinder_template():
     return make_viewfinder_template()
+
 
 # =========================================================
 # 6) Streamlit UI
@@ -190,7 +194,8 @@ st.set_page_config(page_title="シマノ クランク判定", layout="wide")
 st.title("特定製品 自動特定システム")
 st.caption("対応モデル：FCR7100 / FCR8100 / FCR9200 ｜ CNN + 刻印OCR 融合判定")
 
-# --- サイドバー：モデル設定 ---
+
+# --- サイドバー ---
 with st.sidebar:
     st.header("モデル設定")
 
@@ -210,7 +215,6 @@ with st.sidebar:
     st.markdown("---")
     st.header("推論設定")
 
-    # ★安定化：CloudではCPU固定が安全（必要ならOFF）
     force_cpu = st.checkbox(
         "CPU固定（推奨：クラッシュ回避）",
         value=True,
@@ -219,12 +223,12 @@ with st.sidebar:
     dev = device_str(force_cpu=force_cpu)
     st.caption(f"推論デバイス: {dev.upper()}")
 
-    topk    = st.slider("Top-k 表示数", 1, NUM_CLASSES, min(2, NUM_CLASSES))
+    topk = st.slider("Top-k 表示数", 1, NUM_CLASSES, min(2, NUM_CLASSES))
     conf_th = st.slider(
         "確信度しきい値", 0.0, 1.0, 0.5, 0.05,
         help="この値未満の結果は「判定不可」として扱います"
     )
-    BATCH   = st.number_input("バッチサイズ", min_value=1, max_value=64, value=8)
+    BATCH = st.number_input("バッチサイズ", min_value=1, max_value=64, value=8)
 
     st.markdown("---")
     st.header("画像処理（安定化）")
@@ -235,17 +239,16 @@ with st.sidebar:
         help="大きいほど精度は上がりやすいが、負荷も増えます。Cloudで落ちるなら 768/640 を推奨。"
     )
 
-st.markdown("---")
+    st.markdown("---")
     st.header("OCR（刻印読取）")
 
-    # ★重要：デフォルトOFF（自動初期化を避ける）
     use_ocr = st.checkbox(
         "刻印・型番の OCR を使う（重い・初回DLあり）",
         value=False,
         help="初回は検出/認識モデルのDLが走り、Cloudでは落ちることがあります。必要時のみ有効化してください。",
     )
 
-    # ★ここに挿入（OCR対象：刻印優先/全体）
+    # OCR対象（刻印優先/全体）…use_ocr OFFでもキーは定義しておく
     if use_ocr:
         ocr_target = st.selectbox(
             "OCR対象（おすすめ：刻印優先）",
@@ -255,14 +258,12 @@ st.markdown("---")
         )
         ocr_target_key = "stamp" if "STAMP" in ocr_target else "general"
     else:
-        # use_ocr がOFFでも変数が存在するように（事故防止）
         ocr_target_key = "general"
 
     ocr_ok, ocr_msg = ocr_dependencies_ok()
     if use_ocr and not ocr_ok:
         st.warning(ocr_msg)
 
-    # ★OCRの実行方針（自動で走らせない）
     ocr_policy = st.radio(
         "OCRの実行タイミング（推奨：低確信度のみ／手動）",
         ["手動（ボタンを押したときだけ）", "低確信度の画像だけOCR", "常にOCR（非推奨）"],
@@ -270,7 +271,6 @@ st.markdown("---")
         help="Cloudで安定させるため、手動または低確信度のみを推奨します。",
     )
 
-    # thorough は重いのでデフォルト fast
     ocr_mode = st.selectbox(
         "OCRモード",
         ["fast", "thorough"],
@@ -278,10 +278,12 @@ st.markdown("---")
         format_func=lambda x: "高速（撮影向け）" if x == "fast" else "高精度（時間がかかります）",
     )
 
-    # 手動トリガー
+    debug_ocr = st.checkbox("OCRデバッグ表示（実行状況と検出結果）", value=False)
+
     run_ocr_button = False
     if use_ocr and ocr_ok and ocr_policy == "手動（ボタンを押したときだけ）":
         run_ocr_button = st.button("OCRを実行（初回はモデルDL）", type="primary")
+
 
 # --- モデルパス決定 ---
 tmp_model_path: Optional[str] = None
@@ -304,16 +306,14 @@ try:
     model = load_model(use_model_path, NUM_CLASSES, dev)
 except FileNotFoundError as e:
     st.warning(str(e))
-    st.info(
-        "モデルファイルがまだない場合は、サイドバーからアップロードするか、"
-        "train_poc.py で学習を実行してください。"
-    )
+    st.info("モデルファイルがまだない場合は、サイドバーからアップロードするか、train_poc.py で学習を実行してください。")
     st.stop()
 except Exception as e:
     st.error(f"モデル読込失敗: {e}")
     st.stop()
 
 st.sidebar.success("モデル読込 OK")
+
 
 # =========================================================
 # 7) 画像入力（2モード）
@@ -385,11 +385,9 @@ else:
         accept_multiple_files=True,
     )
 
-    # ★安定化：Cloudでの過負荷を避けるため読み込み枚数に上限
-    MAX_FILES = 12  # 必要なら増やせるが、まずは落ちないこと優先
+    MAX_FILES = 12
 
     if up_files:
-        # 多すぎる場合は先頭のみ
         if len(up_files) > MAX_FILES:
             st.warning(f"アップロードが多いため先頭 {MAX_FILES} 件のみ処理します。")
             up_files = up_files[:MAX_FILES]
@@ -397,7 +395,6 @@ else:
         for f in up_files:
             try:
                 if f.name.lower().endswith(".zip"):
-                    # ZIPはメモリ負荷が上がりやすいので注意（中身画像も上限適用）
                     with zipfile.ZipFile(io.BytesIO(f.read())) as zf:
                         infos = list_images_in_zip(zf)
                         if len(infos) > MAX_FILES:
@@ -418,6 +415,7 @@ else:
         st.success(f"{len(pil_images)} 枚の画像を読み込みました。")
     else:
         st.info("ファイルをアップロードしてください。")
+
 
 # =========================================================
 # 8) 推論実行
@@ -443,6 +441,7 @@ for s in range(0, total, int(BATCH)):
 progress.empty()
 probs_all = np.vstack(probs_list)
 
+
 # =========================================================
 # 8.5) OCR 実行判定（自動で重い初期化を走らせない）
 # =========================================================
@@ -453,17 +452,13 @@ if use_ocr and ocr_ok:
     if ocr_policy == "常にOCR（非推奨）":
         run_ocr_for_indices = list(range(len(pil_images)))
     elif ocr_policy == "低確信度の画像だけOCR":
-        # 低確信度のみOCR（負荷が大きく下がる）
-        # CNNだけで十分な画像はOCRを走らせない
         run_ocr_for_indices = [i for i in range(len(pil_images)) if float(np.max(probs_all[i])) < conf_th]
     else:
-        # 手動（ボタンが押されたときだけ）
         if run_ocr_button:
             run_ocr_for_indices = list(range(len(pil_images)))
 
     if run_ocr_for_indices:
         try:
-            # ★ここで初めてOCRを初期化（初回DLが走る）
             ocr_reader = load_ocr_reader()
         except Exception as e:
             st.warning(f"OCR初期化に失敗しました（CNNのみで続行）: {e}")
@@ -471,47 +466,48 @@ if use_ocr and ocr_ok:
             run_ocr_for_indices = []
     else:
         st.info("OCRは実行しません（設定：手動 or 低確信度のみ）。")
- # --- OCR実行対象の確認（デバッグ） ---
-    debug_ocr = st.checkbox("OCRデバッグ表示（実行状況と検出結果）", value=True)
-    
-    if debug_ocr:
-        st.write("use_ocr:", use_ocr, "| ocr_ok:", ocr_ok, "| ocr_policy:", ocr_policy, "| ocr_mode:", ocr_mode)
-        st.write("conf_th:", conf_th)
-        st.write("run_ocr_for_indices:", run_ocr_for_indices)
-        if len(pil_images) > 0:
-            st.write("max CNN prob (per image):", [float(np.max(p)) for p in probs_all])       
 
-# --- OCR + 融合 ---
+
+# --- OCR実行対象の確認（デバッグ） ---
+if debug_ocr:
+    st.write("use_ocr:", use_ocr, "| ocr_ok:", ocr_ok, "| ocr_policy:", ocr_policy, "| ocr_mode:", ocr_mode)
+    st.write("conf_th:", conf_th)
+    st.write("ocr_target_key:", ocr_target_key)
+    st.write("run_ocr_for_indices:", run_ocr_for_indices)
+    if len(pil_images) > 0:
+        st.write("max CNN prob (per image):", [float(np.max(p)) for p in probs_all])
+
+
+# =========================================================
+# 8.6) OCR + 融合
+# =========================================================
 fused_results = []
 ocr_progress = st.progress(0, text="OCR解析中...") if (ocr_reader and run_ocr_for_indices) else None
 
-# OCRをかけない画像はダミー結果で融合（=CNNのみ）
 dummy_ocr = OCRResult(False, None, [], {}, None, 0.0, "")
 
 for i, im in enumerate(pil_images):
     if ocr_reader and (i in run_ocr_for_indices):
         try:
-            ocr_res = recognize_from_image(im, reader=ocr_reader, mode=ocr_mode, target=ocr_target_key)
-            
-              # ===== ここからデバッグ表示（追加） =====
-            if debug_ocr:
-                st.write(f"[OCR] i={i} file={names[i]}")
-                st.write(f"  detections={len(ocr_res.detections)}  best={ocr_res.best_class}  score={float(ocr_res.best_score):.2f}")
-                st.write("  combined_text(head):", (ocr_res.combined_text[:200] if ocr_res.combined_text else "(empty)"))
-
-                if ocr_res.detections:
-                    st.write("  top detections (text/conf/variant):")
-                    for d in ocr_res.detections[:5]:
-                        st.write(f"   - '{d.text}'  conf={d.confidence:.2f}  variant={d.variant}")
-                else:
-                    st.write("  ※検出0件（OCRは実行されたが読めていない）")
-            # ===== ここまでデバッグ表示（追加） =====
-
+            # ocr_engine が target= 未対応でも落ちないようフォールバック
+            try:
+                ocr_res = recognize_from_image(im, reader=ocr_reader, mode=ocr_mode, target=ocr_target_key)
+            except TypeError:
+                ocr_res = recognize_from_image(im, reader=ocr_reader, mode=ocr_mode)
         except Exception as e:
             st.warning(f"OCR失敗（{names[i]}）: {e}（CNNのみで続行）")
             ocr_res = dummy_ocr
     else:
         ocr_res = dummy_ocr
+
+    if debug_ocr and ocr_reader and (i in run_ocr_for_indices):
+        st.write(f"[OCR] i={i} file={names[i]}")
+        st.write(f"  detections={len(ocr_res.detections)}  best={ocr_res.best_class}  score={float(ocr_res.best_score):.2f}")
+        st.write("  combined_text(head):", (ocr_res.combined_text[:200] if ocr_res.combined_text else "(empty)"))
+        if ocr_res.detections:
+            st.write("  top detections (text/conf/variant):")
+            for d in ocr_res.detections[:5]:
+                st.write(f"   - '{d.text}'  conf={d.confidence:.2f}  variant={d.variant}")
 
     fused = fuse_cnn_and_ocr(probs_all[i], CLASS_NAMES, ocr_res)
     fused_results.append(fused)
@@ -532,11 +528,10 @@ METHOD_LABELS = {
     "fusion_cnn": "画像分類を優先",
 }
 
+
 # =========================================================
 # 9) 結果表示
 # =========================================================
-
-# --- カメラモードは大きく1枚表示 ---
 if input_mode == "カメラ撮影（スマホ推奨）" and len(pil_images) == 1:
     conf = float(pred_conf[0])
     label = pred_label[0]
@@ -556,6 +551,7 @@ if input_mode == "カメラ撮影（スマホ推奨）" and len(pil_images) == 1
         st.subheader("判定結果")
         fr = fused_results[0]
         display = get_display_name(label)
+
         if conf >= conf_th:
             st.success(f"**{display}**")
             st.caption(f"クラスID: {label}")
@@ -580,9 +576,9 @@ if input_mode == "カメラ撮影（スマホ推奨）" and len(pil_images) == 1
                 st.code(fr.ocr_text[:500] or "（なし）")
 
         st.markdown("**CNN Top-k**")
-        for i in topk_i:
-            bar_val = float(probs_all[0, i])
-            st.write(f"{get_display_name(CLASS_NAMES[i])} : {bar_val*100:.1f}%")
+        for j in topk_i:
+            bar_val = float(probs_all[0, j])
+            st.write(f"{get_display_name(CLASS_NAMES[j])} : {bar_val*100:.1f}%")
             st.progress(bar_val)
 
         render_manual_section(
@@ -592,7 +588,6 @@ if input_mode == "カメラ撮影（スマホ推奨）" and len(pil_images) == 1
             expanded=conf >= conf_th,
         )
 
-# --- ファイルモードは一覧テーブル + サムネイル ---
 else:
     rows = [
         {
@@ -627,12 +622,8 @@ else:
                 expanded=len(ok_indices) == 1,
             )
     else:
-        st.info(
-            "確信度がしきい値以上の画像がある場合、"
-            "ここにマニュアルへのリンクが表示されます。"
-        )
+        st.info("確信度がしきい値以上の画像がある場合、ここにマニュアルへのリンクが表示されます。")
 
-    # CSV ダウンロード
     csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "結果を CSV でダウンロード",
@@ -641,7 +632,6 @@ else:
         mime="text/csv",
     )
 
-    # 分布バーチャート
     st.subheader("モデル別判定数（確信度しきい値以上）")
     df_ok = df[df["判定"] == "OK"]
     if df_ok.empty:
@@ -650,7 +640,6 @@ else:
         counts = df_ok["最終判定"].value_counts()
         st.bar_chart(counts)
 
-    # サムネイル（最大 12 枚）
     st.subheader("サンプル画像（最大 12 枚）")
     show_n = min(len(pil_images), 12)
     num_cols = 4
@@ -658,7 +647,6 @@ else:
 
     for i in range(show_n):
         topk_i = np.argsort(-probs_all[i])[:topk]
-        fr = fused_results[i]
         caption = (
             f"最終: {get_display_name(pred_label[i])} ({pred_conf[i]*100:.0f}%)\n"
             + " / ".join([f"{CLASS_NAMES[j]}: {probs_all[i, j]*100:.1f}%" for j in topk_i])
