@@ -458,6 +458,15 @@ if use_ocr and ocr_ok:
             run_ocr_for_indices = []
     else:
         st.info("OCRは実行しません（設定：手動 or 低確信度のみ）。")
+ # --- OCR実行対象の確認（デバッグ） ---
+    debug_ocr = st.checkbox("OCRデバッグ表示（実行状況と検出結果）", value=True)
+    
+    if debug_ocr:
+        st.write("use_ocr:", use_ocr, "| ocr_ok:", ocr_ok, "| ocr_policy:", ocr_policy, "| ocr_mode:", ocr_mode)
+        st.write("conf_th:", conf_th)
+        st.write("run_ocr_for_indices:", run_ocr_for_indices)
+        if len(pil_images) > 0:
+            st.write("max CNN prob (per image):", [float(np.max(p)) for p in probs_all])       
 
 # --- OCR + 融合 ---
 fused_results = []
