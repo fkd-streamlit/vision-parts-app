@@ -633,4 +633,3 @@ else:
                 caption=f"{Path(names[i]).name}\n{caption}",
                 width="stretch",
             )
-``
