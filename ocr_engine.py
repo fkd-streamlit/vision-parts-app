@@ -312,10 +312,27 @@ def _spatial_crops_stamp(pil_rgb: Image.Image) -> List[Tuple[str, Image.Image]]:
     """
     w, h = pil_rgb.size
     crops: List[Tuple[str, Image.Image]] = []
+
     crops.append(("no_top", pil_rgb.crop((0, int(h * 0.25), w, h))))
-    crops.append(("center_low", pil_rgb.crop((int(w * 0.15), int(h * 0.35), int(w * 0.85), int(h * 0.95))))
+
+    crops.append((
+        "center_low",
+        pil_rgb.crop((
+            int(w * 0.15), int(h * 0.35),
+            int(w * 0.85), int(h * 0.95)
+        ))
+    ))
+
     crops.append(("bottom_band", pil_rgb.crop((int(w * 0.10), int(h * 0.55), int(w * 0.90), h))))
-    crops.append(("mid_band", pil_rgb.crop((int(w * 0.10), int(h * 0.40), int(w * 0.90), int(h * 0.80))))
+
+    crops.append((
+        "mid_band",
+        pil_rgb.crop((
+            int(w * 0.10), int(h * 0.40),
+            int(w * 0.90), int(h * 0.80)
+        ))
+    ))
+
     return crops[:4]
 
 
