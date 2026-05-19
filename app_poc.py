@@ -245,7 +245,7 @@ st.markdown("---")
         help="初回は検出/認識モデルのDLが走り、Cloudでは落ちることがあります。必要時のみ有効化してください。",
     )
 
-    # ★ここに挿入（OCR対象の選択）
+    # ★ここに挿入（OCR対象：刻印優先/全体）
     if use_ocr:
         ocr_target = st.selectbox(
             "OCR対象（おすすめ：刻印優先）",
@@ -255,7 +255,7 @@ st.markdown("---")
         )
         ocr_target_key = "stamp" if "STAMP" in ocr_target else "general"
     else:
-        # use_ocr がOFFでも変数が必ず定義されるようにしておく（事故防止）
+        # use_ocr がOFFでも変数が存在するように（事故防止）
         ocr_target_key = "general"
 
     ocr_ok, ocr_msg = ocr_dependencies_ok()
@@ -282,6 +282,7 @@ st.markdown("---")
     run_ocr_button = False
     if use_ocr and ocr_ok and ocr_policy == "手動（ボタンを押したときだけ）":
         run_ocr_button = st.button("OCRを実行（初回はモデルDL）", type="primary")
+``
 
 # --- モデルパス決定 ---
 tmp_model_path: Optional[str] = None
