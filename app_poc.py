@@ -491,9 +491,9 @@ dummy_ocr = OCRResult(False, None, [], {}, None, 0.0, "")
 for i, im in enumerate(pil_images):
     if ocr_reader and (i in run_ocr_for_indices):
         try:
-            ocr_res = recognize_from_image(im, reader=ocr_reader, mode=ocr_mode)
-
-            # ===== ここからデバッグ表示（追加） =====
+            ocr_res = recognize_from_image(im, reader=ocr_reader, mode=ocr_mode, target=ocr_target_key)
+            
+              # ===== ここからデバッグ表示（追加） =====
             if debug_ocr:
                 st.write(f"[OCR] i={i} file={names[i]}")
                 st.write(f"  detections={len(ocr_res.detections)}  best={ocr_res.best_class}  score={float(ocr_res.best_score):.2f}")
