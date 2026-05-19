@@ -479,8 +479,22 @@ for i, im in enumerate(pil_images):
     if ocr_reader and (i in run_ocr_for_indices):
         try:
             ocr_res = recognize_from_image(im, reader=ocr_reader, mode=ocr_mode)
+
+            # ===== ここからデバッグ表示（追加） =====
+            if debug_ocr:
+                st.write(f"[OCR] i={i} file={names[i]}")
+                st.write(f"  detections={len(ocr_res.detections)}  best={ocr_res.best_class}  score={float(ocr_res.best_score):.2f}")
+                st.write("  combined_text(head):", (ocr_res.combined_text[:200] if ocr_res.combined_text else "(empty)"))
+
+                if ocr_res.detections:
+                    st.write("  top detections (text/conf/variant):")
+                    for d in ocr_res.detections[:5]:
+                        st.write(f"   - '{d.text}'  conf={d.confidence:.2f}  variant={d.variant}")
+                else:
+                    st.write("  ※検出0件（OCRは実行されたが読めていない）")
+            # ===== ここまでデバッグ表示（追加） =====
+
         except Exception as e:
-            # OCRで落ちないようにガード
             st.warning(f"OCR失敗（{names[i]}）: {e}（CNNのみで続行）")
             ocr_res = dummy_ocr
     else:
