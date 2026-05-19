@@ -6,9 +6,9 @@
 【安定化パッチ（2026-05）】
 - 入力画像は必ず縮小（max_side）してメモリピークを抑制
 - 前処理バリアント数を削減（thoroughでも暴れない）
-- crop数も制限（fast=中心のみ / thoroughでも最大4）
+- crop数も制限（fast=full+center / thorough=full+center+lower）
 - EasyOCR Reader は gpu=False 固定（Cloud安定化）
-- OCR失敗時は例外を抑え、呼び出し側でCNN継続できる設計
+- OCRが読めないケース救済のため、raw（加工前）を allowlist なしで必ず一度OCRに通す
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageEnhance
 
 from config import (
     CLASS_NAMES,
@@ -89,7 +89,7 @@ class FusedPrediction:
 # -----------------------------
 _reader = None
 
-# 安定化：OCRに渡す最大辺（Cloud向け）
+# Cloud向け：OCRに渡す最大辺（処理負荷と精度のバランス）
 OCR_MAX_SIDE_FAST = 896
 OCR_MAX_SIDE_THOROUGH = 1024
 
@@ -112,7 +112,6 @@ def get_ocr_reader():
     if not ok:
         raise RuntimeError(msg)
     if _reader is None:
-        # verbose=False でログを抑制、gpu=False で安定化
         _reader = easyocr.Reader(["en"], gpu=False, verbose=False)
     return _reader
 
@@ -143,7 +142,7 @@ def _pil_to_rgb_uint8(im: Image.Image) -> np.ndarray:
 def _rgb_to_gray(arr_rgb: np.ndarray) -> np.ndarray:
     """RGB uint8 -> Gray uint8"""
     if not HAS_CV2:
-        # fallback: simple luminance
+        # fallback luminance
         r = arr_rgb[..., 0].astype(np.float32)
         g = arr_rgb[..., 1].astype(np.float32)
         b = arr_rgb[..., 2].astype(np.float32)
@@ -162,9 +161,8 @@ def _clahe_gray(gray: np.ndarray) -> np.ndarray:
 
 
 def _otsu_inv(gray: np.ndarray) -> np.ndarray:
-    """Gray -> Otsu -> invert if needed (刻印が白っぽく出る想定)"""
+    """Gray -> Otsu -> invert if needed"""
     if not HAS_CV2:
-        # 代替：単純二値化
         thr = int(np.mean(gray))
         bw = (gray > thr).astype(np.uint8) * 255
         if np.mean(bw) > 127:
@@ -181,9 +179,9 @@ def _otsu_inv(gray: np.ndarray) -> np.ndarray:
 # -----------------------------
 def preprocess_variants(pil_rgb: Image.Image, mode: str = OCR_MODE) -> List[Tuple[str, np.ndarray]]:
     """
-    黒製品の刻印向けに少数の前処理画像を生成（RGB uint8）。
-    - fast: original / clahe / otsu_inv の3種程度
-    - thorough: 上記 + pil_hi_contrast を追加（最大4種）
+    少数の前処理画像を生成（RGB uint8）。
+    - fast: original / clahe / otsu_inv
+    - thorough: + pil_hi_contrast（最大4種）
     """
     max_side = OCR_MAX_SIDE_THOROUGH if mode == "thorough" else OCR_MAX_SIDE_FAST
     base = _resize_max_side(pil_rgb.convert("RGB"), max_side=max_side)
@@ -191,24 +189,20 @@ def preprocess_variants(pil_rgb: Image.Image, mode: str = OCR_MODE) -> List[Tupl
     rgb = _pil_to_rgb_uint8(base)
     variants: List[Tuple[str, np.ndarray]] = [("original", rgb)]
 
-    # gray->clahe
     gray = _rgb_to_gray(rgb)
     g_clahe = _clahe_gray(gray)
     clahe_rgb = np.stack([g_clahe, g_clahe, g_clahe], axis=-1)
     variants.append(("clahe", clahe_rgb))
 
-    # otsu_inv
     bw = _otsu_inv(g_clahe)
     bw_rgb = np.stack([bw, bw, bw], axis=-1)
     variants.append(("otsu_inv", bw_rgb))
 
     if mode == "thorough":
-        # PILでコントラスト&シャープ（重すぎない範囲）
         hi = ImageEnhance.Contrast(base).enhance(2.0)
         hi = ImageEnhance.Sharpness(hi).enhance(1.6)
         variants.append(("pil_hi_contrast", _pil_to_rgb_uint8(hi)))
 
-    # 安全：最大4種類まで
     return variants[:4]
 
 
@@ -245,7 +239,7 @@ def _score_digit_hints(compact: str) -> Dict[str, float]:
         if f"R{digits}" in compact or f"FCR{digits}" in compact or f"FC{digits}" in compact:
             scores[cls] = max(scores[cls], 0.88)
 
-    # 7I00 / 7l00 / 9Z00 等の誤認識を軽く救う
+    # 7I00 / 7l00 / 9Z00 等の誤認識救済
     fuzzy = [
         (r"7[1IL\|][0O]{2}", "FCR7100", 0.58),
         (r"8[1IL\|][0O]{2}", "FCR8100", 0.58),
@@ -274,7 +268,6 @@ def score_text_against_patterns(text: str) -> List[OCRClassScore]:
         if best > 0:
             matched.append(f"digits:{cls}")
 
-        # config.OCR_PATTERNS を利用（既存互換）
         for pattern, weight in OCR_PATTERNS.get(cls, []):
             m = re.search(pattern, norm, re.IGNORECASE)
             if m:
@@ -294,16 +287,12 @@ def score_text_against_patterns(text: str) -> List[OCRClassScore]:
 def _spatial_crops(pil_rgb: Image.Image, mode: str = OCR_MODE) -> List[Tuple[str, Image.Image]]:
     """
     刻印が写りやすい領域を切り出す（軽量版）。
-    - fast: centerのみ
+    - fast: full + center（最大2）
     - thorough: full + center + lower（最大3）
     """
     w, h = pil_rgb.size
-    crops: List[Tuple[str, Image.Image]] = []
+    crops: List[Tuple[str, Image.Image]] = [("full", pil_rgb)]
 
-    # fullは必ず入れる（ただし縮小済み前提）
-    crops.append(("full", pil_rgb))
-
-    # center
     center = pil_rgb.crop((int(w * 0.12), int(h * 0.12), int(w * 0.88), int(h * 0.88)))
     crops.append(("center", center))
 
@@ -311,7 +300,6 @@ def _spatial_crops(pil_rgb: Image.Image, mode: str = OCR_MODE) -> List[Tuple[str
         lower = pil_rgb.crop((int(w * 0.10), int(h * 0.45), int(w * 0.90), int(h * 0.98)))
         crops.append(("lower", lower))
 
-    # 安全：最大3
     return crops[:3]
 
 
@@ -394,47 +382,47 @@ def recognize_from_image(
                 combined_text="",
             )
 
-    # 入力全体を縮小（最重要：必ず縮小する）
+    # 入力全体を縮小（最重要）
     max_side = OCR_MAX_SIDE_THOROUGH if mode == "thorough" else OCR_MAX_SIDE_FAST
     base = _resize_max_side(pil_rgb.convert("RGB"), max_side=max_side)
 
-    # allowlist は英数記号に制限して誤検出を減らす
+    # allowlist は英数記号に制限（ただし「raw救済」は allowlist なし）
     allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ- "
 
     all_detections: List[OCRDetection] = []
 
-    # crop数を制限（fast: full+center だけ、thorough: +lower）
-    crops = _spatial_crops(base, mode=mode)
-# ★追加：raw（加工前）を allowlist なしで一度OCRに通す
-    # カタログ画像や太字文字、反射で二値化が壊れるケースの救済
+    # ★追加：raw（加工前）を allowlist なしで一度OCRに通す（読めないケース救済）
     try:
-        raw_rgb = np.array(base)  # base は既にRGB & 縮小済み
+        raw_rgb = _pil_to_rgb_uint8(base)
         all_detections.extend(
             _run_easyocr_on_variant(reader, raw_rgb, "raw/original", allowlist=None)
         )
     except Exception:
         pass
 
-    # variant数も制限（max 4）
+    # crop数を制限
+    crops = _spatial_crops(base, mode=mode)
+
     for cname, crop in crops:
         variants = preprocess_variants(crop, mode=mode)
+
         for vname, arr in variants:
             tag = f"{cname}/{vname}"
-            # otsu_invのみ allowlist を付けて精度を稼ぐ（負荷も増えない）
-        if vname == "otsu_inv":
+
+            if vname == "otsu_inv":
+                # otsu_inv は allowlist を付けて型番に寄せる
                 all_detections.extend(
                     _run_easyocr_on_variant(reader, arr, tag + "+alnum", allowlist=allowlist)
                 )
             elif cname == "full" and vname == "original":
-                # ★追加：full/original は allowlist なし（太字や記号混じり救済）
+                # ★追加：full/original も allowlist なしで保険（太字・記号で落ちる救済）
                 all_detections.extend(
                     _run_easyocr_on_variant(reader, arr, tag + "+raw", allowlist=None)
                 )
             else:
                 all_detections.extend(_run_easyocr_on_variant(reader, arr, tag))
-``
 
-        # 安全：検出が大量なら打ち切り（メモリ/時間対策）
+        # 安全：検出が多すぎる場合は打ち切り（暴走防止）
         if len(all_detections) > 80:
             break
 
@@ -454,7 +442,10 @@ def recognize_from_image(
             for d in all_detections:
                 if d.text == t or t in d.text:
                     det_boost = max(det_boost, float(d.confidence) * 0.15)
-            agg[sc.class_name] = max(agg[sc.class_name], min(1.0, float(sc.score) + det_boost))
+            agg[sc.class_name] = max(
+                agg[sc.class_name],
+                min(1.0, float(sc.score) + det_boost)
+            )
 
     best_class: Optional[str] = None
     best_score: float = 0.0
