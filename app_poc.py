@@ -40,8 +40,6 @@ from camera_guide import (
     SHOOTING_TIPS,
     draw_guide_overlay,
     get_shooting_examples,
-    guide_overlay_html,
-    make_viewfinder_template,
 )
 from product_catalog import render_manual_section
 
@@ -180,11 +178,6 @@ def load_model(model_path: str, num_classes: int, device: str) -> torch.nn.Modul
 def load_ocr_reader():
     from ocr_engine import get_ocr_reader
     return get_ocr_reader()
-
-
-@st.cache_data
-def cached_viewfinder_template():
-    return make_viewfinder_template()
 
 
 # =========================================================
@@ -332,7 +325,7 @@ pil_images: List[Image.Image] = []
 # ---- モード A：カメラ撮影 ----
 if input_mode == "カメラ撮影（スマホ推奨）":
     with st.expander("📷 撮影ガイド・撮影例", expanded=True):
-        st.markdown("**刻印（R7100 等）を緑の枠内に収めて撮影**すると、OCRの精度が上がります。")
+        st.markdown("**刻印（R7100 等）がはっきり写るよう近づけて撮影**すると、OCRの精度が上がります。")
         for tip in SHOOTING_TIPS:
             st.markdown(f"- {tip}")
 
@@ -356,18 +349,8 @@ if input_mode == "カメラ撮影（スマホ推奨）":
         for title, desc in BAD_EXAMPLES:
             st.markdown(f"- **{title}** — {desc}")
 
-    guide_col1, guide_col2 = st.columns([1, 1])
-    with guide_col1:
-        st.image(
-            cached_viewfinder_template(),
-            caption="ビューファインダー（撮影イメージ）",
-            width="stretch",
-        )
-    with guide_col2:
-        st.markdown(guide_overlay_html(), unsafe_allow_html=True)
-
-    st.info("スマホでこのページを開き、枠を参考に刻印を合わせてから撮影してください。")
-    img_file = st.camera_input("クランクの刻印を枠内に合わせて撮影")
+    st.info("刻印（R7100 等）がはっきり写るよう近づけて撮影してください。撮影後、結果画像に緑枠でOCR範囲を表示します。")
+    img_file = st.camera_input("クランクの刻印を撮影")
 
     if img_file is not None:
         try:
