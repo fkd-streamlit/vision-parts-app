@@ -1,18 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-刻印・ロゴの OCR と型番パターンマッチ（軽量・安定版 + Step1: 回転スキャンOCR）
-黒ベース製品向けに前処理バリアントを試し、CNN結果と融合する。
+ocr_engine.py
+刻印・ロゴの OCR と型番パターンマッチ（A：刻印優先OCR対応版）
 
-【安定化パッチ（2026-05）】
-- 入力画像は必ず縮小（max_side）してメモリピークを抑制
-- 前処理バリアント数を削減（thoroughでも暴れない）
-- crop数も制限（fast=full+center / thorough=full+center+lower）
-- EasyOCR Reader は gpu=False 固定（Cloud安定化）
-- OCRが読めないケース救済：raw（加工前）を allowlist なしで必ず1回OCRに通す
-
-【Step1（向き不明対策）】
-- 画像を 0/90/180/270° 回転してOCRを実行し、最良結果を採用
-- （オプション）90°刻みで全滅した場合のみ ±15°を試す（軽量に）
+【ポイント】
+- target="stamp" : 刻印優先（背景文字を拾いにくいROI + 強いallowlist）
+- target="general": 全体文字（従来のfull/center/lower）
+- 回転スキャン（0/90/180/270）で向き不明を吸収
+- 早期終了（best_scoreが十分なら回転スキャンを打ち切る）
+- 数字誤読補正（O↔0, Z↔2, I/L↔1, S↔5, B↔8）を digits 判定側にだけ適用
 """
 
 from __future__ import annotations
@@ -93,15 +89,19 @@ class FusedPrediction:
 # -----------------------------
 _reader = None
 
-# Cloud向け：OCRに渡す最大辺（処理負荷と精度のバランス）
 OCR_MAX_SIDE_FAST = 896
 OCR_MAX_SIDE_THOROUGH = 1024
 
-# Step1: 回転候補（90°刻み）
 ROTATION_DEGREES = [0, 90, 180, 270]
+FALLBACK_SMALL_TILTS = [-15, 15]  # 必要時のみ
 
-# 90°刻みで検出ゼロだった時だけ試す微調整角（軽量）
-FALLBACK_SMALL_TILTS = [-15, 15]
+# STAMP（刻印）向け：強いallowlist
+ALLOWLIST_STAMP = "0123456789FCR- "
+# GENERAL（全体）向け：制限なし（ロゴ等も拾える）
+ALLOWLIST_GENERAL = None
+
+# 早期終了（OCRが十分強く決まったら回転を打ち切る）
+EARLY_STOP_SCORE = 0.78
 
 
 # -----------------------------
@@ -130,7 +130,6 @@ def get_ocr_reader():
 # Image helpers
 # -----------------------------
 def _resize_max_side(im: Image.Image, max_side: int) -> Image.Image:
-    """最大辺が max_side を超える場合は縮小（必ず縮小方向）。"""
     w, h = im.size
     m = max(w, h)
     if m <= max_side:
@@ -140,7 +139,6 @@ def _resize_max_side(im: Image.Image, max_side: int) -> Image.Image:
 
 
 def _pil_to_rgb_uint8(im: Image.Image) -> np.ndarray:
-    """PIL RGB -> numpy RGB uint8"""
     if im.mode != "RGB":
         im = im.convert("RGB")
     arr = np.array(im)
@@ -150,7 +148,6 @@ def _pil_to_rgb_uint8(im: Image.Image) -> np.ndarray:
 
 
 def _rgb_to_gray(arr_rgb: np.ndarray) -> np.ndarray:
-    """RGB uint8 -> Gray uint8"""
     if not HAS_CV2:
         r = arr_rgb[..., 0].astype(np.float32)
         g = arr_rgb[..., 1].astype(np.float32)
@@ -162,7 +159,6 @@ def _rgb_to_gray(arr_rgb: np.ndarray) -> np.ndarray:
 
 
 def _clahe_gray(gray: np.ndarray) -> np.ndarray:
-    """Gray -> CLAHE Gray"""
     if not HAS_CV2:
         return gray
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
@@ -170,7 +166,6 @@ def _clahe_gray(gray: np.ndarray) -> np.ndarray:
 
 
 def _otsu_inv(gray: np.ndarray) -> np.ndarray:
-    """Gray -> Otsu -> invert if needed"""
     if not HAS_CV2:
         thr = int(np.mean(gray))
         bw = (gray > thr).astype(np.uint8) * 255
@@ -184,14 +179,9 @@ def _otsu_inv(gray: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------
-# Preprocess variants (軽量版)
+# Preprocess variants (軽量)
 # -----------------------------
 def preprocess_variants(pil_rgb: Image.Image, mode: str = OCR_MODE) -> List[Tuple[str, np.ndarray]]:
-    """
-    少数の前処理画像を生成（RGB uint8）。
-    - fast: original / clahe / otsu_inv
-    - thorough: + pil_hi_contrast（最大4種）
-    """
     max_side = OCR_MAX_SIDE_THOROUGH if mode == "thorough" else OCR_MAX_SIDE_FAST
     base = _resize_max_side(pil_rgb.convert("RGB"), max_side=max_side)
 
@@ -225,6 +215,23 @@ def _normalize_ocr_text(text: str) -> str:
     return t
 
 
+def _compact_alnum(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+
+
+def _digit_fuzzy_compact(compact: str) -> str:
+    """数字誤読補正（digits判定のみに適用）"""
+    if not compact:
+        return compact
+    t = compact
+    t = t.replace("O", "0").replace("Q", "0")
+    t = t.replace("Z", "2")
+    t = t.replace("S", "5")
+    t = t.replace("I", "1").replace("L", "1")
+    t = t.replace("B", "8")
+    return t
+
+
 _DIGIT_CLASS = {
     "7100": "FCR7100",
     "8100": "FCR8100",
@@ -232,12 +239,7 @@ _DIGIT_CLASS = {
 }
 
 
-def _compact_alnum(text: str) -> str:
-    return re.sub(r"[^A-Z0-9]", "", (text or "").upper())
-
-
 def _score_digit_hints(compact: str) -> Dict[str, float]:
-    """OCR誤認識を考慮し 7100 / 8100 / 9200 を探す。"""
     scores: Dict[str, float] = {c: 0.0 for c in CLASS_NAMES}
     if not compact:
         return scores
@@ -261,13 +263,13 @@ def _score_digit_hints(compact: str) -> Dict[str, float]:
 
 
 def score_text_against_patterns(text: str) -> List[OCRClassScore]:
-    """読み取り文字列から各クラスのスコアを算出。"""
     norm = _normalize_ocr_text(text)
     if not norm:
         return []
 
     compact = _compact_alnum(norm)
-    digit_hints = _score_digit_hints(compact)
+    compact_fuzzy = _digit_fuzzy_compact(compact)
+    digit_hints = _score_digit_hints(compact_fuzzy)
 
     results: List[OCRClassScore] = []
     for cls in CLASS_NAMES:
@@ -290,25 +292,31 @@ def score_text_against_patterns(text: str) -> List[OCRClassScore]:
 
 
 # -----------------------------
-# Crops (軽量版)
+# Crops
 # -----------------------------
-def _spatial_crops(pil_rgb: Image.Image, mode: str = OCR_MODE) -> List[Tuple[str, Image.Image]]:
-    """
-    刻印が写りやすい領域を切り出す（軽量版）。
-    - fast: full + center
-    - thorough: full + center + lower
-    """
+def _spatial_crops_general(pil_rgb: Image.Image, mode: str) -> List[Tuple[str, Image.Image]]:
     w, h = pil_rgb.size
     crops: List[Tuple[str, Image.Image]] = [("full", pil_rgb)]
-
     center = pil_rgb.crop((int(w * 0.12), int(h * 0.12), int(w * 0.88), int(h * 0.88)))
     crops.append(("center", center))
-
     if mode == "thorough":
         lower = pil_rgb.crop((int(w * 0.10), int(h * 0.45), int(w * 0.90), int(h * 0.98)))
         crops.append(("lower", lower))
-
     return crops[:3]
+
+
+def _spatial_crops_stamp(pil_rgb: Image.Image) -> List[Tuple[str, Image.Image]]:
+    """
+    刻印優先（STAMP）：
+    背景文字を拾いにくい帯を複数試す（向き不明は回転スキャンで吸収）。
+    """
+    w, h = pil_rgb.size
+    crops: List[Tuple[str, Image.Image]] = []
+    crops.append(("no_top", pil_rgb.crop((0, int(h * 0.25), w, h))))
+    crops.append(("center_low", pil_rgb.crop((int(w * 0.15), int(h * 0.35), int(w * 0.85), int(h * 0.95))))
+    crops.append(("bottom_band", pil_rgb.crop((int(w * 0.10), int(h * 0.55), int(w * 0.90), h))))
+    crops.append(("mid_band", pil_rgb.crop((int(w * 0.10), int(h * 0.40), int(w * 0.90), int(h * 0.80))))
+    return crops[:4]
 
 
 # -----------------------------
@@ -351,38 +359,38 @@ def _recognize_single_orientation(
     pil_rgb: Image.Image,
     reader,
     mode: str,
+    target: str,
 ) -> OCRResult:
-    """単一向き（回転済み）画像でOCRを実行して結果を返す。"""
     max_side = OCR_MAX_SIDE_THOROUGH if mode == "thorough" else OCR_MAX_SIDE_FAST
     base = _resize_max_side(pil_rgb.convert("RGB"), max_side=max_side)
 
-    allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ- "
+    if target == "stamp":
+        allowlist = ALLOWLIST_STAMP
+        crops = _spatial_crops_stamp(base)
+    else:
+        allowlist = ALLOWLIST_GENERAL
+        crops = _spatial_crops_general(base, mode=mode)
 
     all_detections: List[OCRDetection] = []
 
-    # ★救済：raw（加工前）を allowlist なしで1回OCR
+    # raw救済（STAMPはallowlistで絞る）
     try:
         raw_rgb = _pil_to_rgb_uint8(base)
-        all_detections.extend(_run_easyocr_on_variant(reader, raw_rgb, "raw/original", allowlist=None))
+        all_detections.extend(_run_easyocr_on_variant(reader, raw_rgb, "raw/original", allowlist=allowlist))
     except Exception:
         pass
 
-    crops = _spatial_crops(base, mode=mode)
-
     for cname, crop in crops:
         variants = preprocess_variants(crop, mode=mode)
-
         for vname, arr in variants:
             tag = f"{cname}/{vname}"
-            if vname == "otsu_inv":
-                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag + "+alnum", allowlist=allowlist))
-            elif cname == "full" and vname == "original":
-                # 太字/記号の救済
-                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag + "+raw", allowlist=None))
-            else:
-                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag, allowlist=None))
 
-        if len(all_detections) > 80:
+            if target == "stamp" and vname == "otsu_inv":
+                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag + "+alnum", allowlist=ALLOWLIST_STAMP))
+            else:
+                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag, allowlist=allowlist))
+
+        if len(all_detections) > 90:
             break
 
     combined = " | ".join(d.text for d in all_detections)
@@ -412,29 +420,22 @@ def _recognize_single_orientation(
 
 
 def _ocr_result_rank_key(res: OCRResult) -> Tuple[int, float, int]:
-    """
-    OCR結果の優劣を比較するキー（大きいほど良い）。
-    1) best_score があるか（best_classの有無）
-    2) best_score
-    3) detections数
-    """
     has_best = 1 if (res.best_class is not None and res.best_score > 0) else 0
     return (has_best, float(res.best_score), len(res.detections))
 
 
 # -----------------------------
-# Public API: recognize_from_image (Step1: 回転スキャン)
+# Public API: recognize_from_image
 # -----------------------------
 def recognize_from_image(
     pil_rgb: Image.Image,
     reader=None,
     mode: str = OCR_MODE,
+    target: str = "general",   # "stamp" or "general"
 ) -> OCRResult:
-    """1枚の画像から OCR + パターンマッチ（回転スキャン対応）。"""
     ok, msg = ocr_dependencies_ok()
     if not ok:
         return OCRResult(False, msg, [], {}, None, 0.0, "")
-
     if pil_rgb is None:
         return OCRResult(False, "入力画像がNoneです", [], {}, None, 0.0, "")
 
@@ -444,29 +445,33 @@ def recognize_from_image(
         except Exception as e:
             return OCRResult(False, f"OCR Reader 初期化失敗: {e}", [], {}, None, 0.0, "")
 
-    # 1) まず 0/90/180/270 の回転で試す
     candidates: List[OCRResult] = []
+    best: Optional[OCRResult] = None
+    best_key = (0, 0.0, 0)
+
     for deg in ROTATION_DEGREES:
         try:
-            if deg == 0:
-                im_rot = pil_rgb
-            else:
-                im_rot = pil_rgb.rotate(deg, expand=True)
-            res = _recognize_single_orientation(im_rot, reader=reader, mode=mode)
-            # どの回転か分かるよう variant にタグを付ける（軽量）
+            im_rot = pil_rgb if deg == 0 else pil_rgb.rotate(deg, expand=True)
+            res = _recognize_single_orientation(im_rot, reader=reader, mode=mode, target=target)
             if res.detections:
                 for d in res.detections:
                     d.variant = f"rot{deg}/" + d.variant
+
             candidates.append(res)
+            key = _ocr_result_rank_key(res)
+            if key > best_key:
+                best, best_key = res, key
+
+            # 早期終了（負荷軽減）
+            if res.best_class is not None and float(res.best_score) >= EARLY_STOP_SCORE:
+                break
         except Exception:
             continue
 
-    if candidates:
-        best = max(candidates, key=_ocr_result_rank_key)
-    else:
+    if best is None:
         best = OCRResult(True, None, [], {}, None, 0.0, "")
 
-    # 2) 90°刻みで「検出ゼロ」なら、微調整角（±15°）を追加で試す（軽量）
+    # 90°刻みで検出ゼロの時だけ微調整（fastのみ）
     if len(best.detections) == 0 and mode == "fast":
         tilt_candidates: List[OCRResult] = []
         for deg in ROTATION_DEGREES:
@@ -474,7 +479,7 @@ def recognize_from_image(
             for tilt in FALLBACK_SMALL_TILTS:
                 try:
                     im_tilt = base_rot.rotate(tilt, expand=True)
-                    res = _recognize_single_orientation(im_tilt, reader=reader, mode=mode)
+                    res = _recognize_single_orientation(im_tilt, reader=reader, mode=mode, target=target)
                     if res.detections:
                         for d in res.detections:
                             d.variant = f"rot{deg}_tilt{tilt}/" + d.variant
@@ -497,7 +502,6 @@ def fuse_cnn_and_ocr(
     class_names: List[str],
     ocr: OCRResult,
 ) -> FusedPrediction:
-    """CNN softmax と OCR スコアを融合（既存互換）。"""
     cnn_idx = int(np.argmax(cnn_probs))
     cnn_label = class_names[cnn_idx]
     cnn_conf = float(cnn_probs[cnn_idx])
