@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-刻印・ロゴの OCR と型番パターンマッチ（軽量・安定版）
+刻印・ロゴの OCR と型番パターンマッチ（軽量・安定版 + Step1: 回転スキャンOCR）
 黒ベース製品向けに前処理バリアントを試し、CNN結果と融合する。
 
 【安定化パッチ（2026-05）】
@@ -8,7 +8,11 @@
 - 前処理バリアント数を削減（thoroughでも暴れない）
 - crop数も制限（fast=full+center / thorough=full+center+lower）
 - EasyOCR Reader は gpu=False 固定（Cloud安定化）
-- OCRが読めないケース救済のため、raw（加工前）を allowlist なしで必ず一度OCRに通す
+- OCRが読めないケース救済：raw（加工前）を allowlist なしで必ず1回OCRに通す
+
+【Step1（向き不明対策）】
+- 画像を 0/90/180/270° 回転してOCRを実行し、最良結果を採用
+- （オプション）90°刻みで全滅した場合のみ ±15°を試す（軽量に）
 """
 
 from __future__ import annotations
@@ -93,6 +97,12 @@ _reader = None
 OCR_MAX_SIDE_FAST = 896
 OCR_MAX_SIDE_THOROUGH = 1024
 
+# Step1: 回転候補（90°刻み）
+ROTATION_DEGREES = [0, 90, 180, 270]
+
+# 90°刻みで検出ゼロだった時だけ試す微調整角（軽量）
+FALLBACK_SMALL_TILTS = [-15, 15]
+
 
 # -----------------------------
 # Dependencies
@@ -142,7 +152,6 @@ def _pil_to_rgb_uint8(im: Image.Image) -> np.ndarray:
 def _rgb_to_gray(arr_rgb: np.ndarray) -> np.ndarray:
     """RGB uint8 -> Gray uint8"""
     if not HAS_CV2:
-        # fallback luminance
         r = arr_rgb[..., 0].astype(np.float32)
         g = arr_rgb[..., 1].astype(np.float32)
         b = arr_rgb[..., 2].astype(np.float32)
@@ -239,7 +248,6 @@ def _score_digit_hints(compact: str) -> Dict[str, float]:
         if f"R{digits}" in compact or f"FCR{digits}" in compact or f"FC{digits}" in compact:
             scores[cls] = max(scores[cls], 0.88)
 
-    # 7I00 / 7l00 / 9Z00 等の誤認識救済
     fuzzy = [
         (r"7[1IL\|][0O]{2}", "FCR7100", 0.58),
         (r"8[1IL\|][0O]{2}", "FCR8100", 0.58),
@@ -287,8 +295,8 @@ def score_text_against_patterns(text: str) -> List[OCRClassScore]:
 def _spatial_crops(pil_rgb: Image.Image, mode: str = OCR_MODE) -> List[Tuple[str, Image.Image]]:
     """
     刻印が写りやすい領域を切り出す（軽量版）。
-    - fast: full + center（最大2）
-    - thorough: full + center + lower（最大3）
+    - fast: full + center
+    - thorough: full + center + lower
     """
     w, h = pil_rgb.size
     crops: List[Tuple[str, Image.Image]] = [("full", pil_rgb)]
@@ -304,7 +312,7 @@ def _spatial_crops(pil_rgb: Image.Image, mode: str = OCR_MODE) -> List[Tuple[str
 
 
 # -----------------------------
-# EasyOCR runner (ガード強化)
+# EasyOCR runner
 # -----------------------------
 def _run_easyocr_on_variant(
     reader,
@@ -337,70 +345,28 @@ def _run_easyocr_on_variant(
 
 
 # -----------------------------
-# Public API: recognize_from_image
+# Single-orientation OCR core
 # -----------------------------
-def recognize_from_image(
+def _recognize_single_orientation(
     pil_rgb: Image.Image,
-    reader=None,
-    mode: str = OCR_MODE,
+    reader,
+    mode: str,
 ) -> OCRResult:
-    """1枚の画像から OCR + パターンマッチ（軽量・安定版）。"""
-    ok, msg = ocr_dependencies_ok()
-    if not ok:
-        return OCRResult(
-            available=False,
-            error=msg,
-            detections=[],
-            class_scores={},
-            best_class=None,
-            best_score=0.0,
-            combined_text="",
-        )
-
-    if pil_rgb is None:
-        return OCRResult(
-            available=False,
-            error="入力画像がNoneです",
-            detections=[],
-            class_scores={},
-            best_class=None,
-            best_score=0.0,
-            combined_text="",
-        )
-
-    if reader is None:
-        try:
-            reader = get_ocr_reader()
-        except Exception as e:
-            return OCRResult(
-                available=False,
-                error=f"OCR Reader 初期化失敗: {e}",
-                detections=[],
-                class_scores={},
-                best_class=None,
-                best_score=0.0,
-                combined_text="",
-            )
-
-    # 入力全体を縮小（最重要）
+    """単一向き（回転済み）画像でOCRを実行して結果を返す。"""
     max_side = OCR_MAX_SIDE_THOROUGH if mode == "thorough" else OCR_MAX_SIDE_FAST
     base = _resize_max_side(pil_rgb.convert("RGB"), max_side=max_side)
 
-    # allowlist は英数記号に制限（ただし「raw救済」は allowlist なし）
     allowlist = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ- "
 
     all_detections: List[OCRDetection] = []
 
-    # ★追加：raw（加工前）を allowlist なしで一度OCRに通す（読めないケース救済）
+    # ★救済：raw（加工前）を allowlist なしで1回OCR
     try:
         raw_rgb = _pil_to_rgb_uint8(base)
-        all_detections.extend(
-            _run_easyocr_on_variant(reader, raw_rgb, "raw/original", allowlist=None)
-        )
+        all_detections.extend(_run_easyocr_on_variant(reader, raw_rgb, "raw/original", allowlist=None))
     except Exception:
         pass
 
-    # crop数を制限
     crops = _spatial_crops(base, mode=mode)
 
     for cname, crop in crops:
@@ -408,44 +374,31 @@ def recognize_from_image(
 
         for vname, arr in variants:
             tag = f"{cname}/{vname}"
-
             if vname == "otsu_inv":
-                # otsu_inv は allowlist を付けて型番に寄せる
-                all_detections.extend(
-                    _run_easyocr_on_variant(reader, arr, tag + "+alnum", allowlist=allowlist)
-                )
+                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag + "+alnum", allowlist=allowlist))
             elif cname == "full" and vname == "original":
-                # ★追加：full/original も allowlist なしで保険（太字・記号で落ちる救済）
-                all_detections.extend(
-                    _run_easyocr_on_variant(reader, arr, tag + "+raw", allowlist=None)
-                )
+                # 太字/記号の救済
+                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag + "+raw", allowlist=None))
             else:
-                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag))
+                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag, allowlist=None))
 
-        # 安全：検出が多すぎる場合は打ち切り（暴走防止）
         if len(all_detections) > 80:
             break
 
     combined = " | ".join(d.text for d in all_detections)
 
-    # 全文 + 各検出行を個別にスコア化し最大を採用
     texts_to_score = [combined] + [d.text for d in all_detections]
-
     agg: Dict[str, float] = {c: 0.0 for c in CLASS_NAMES}
+
     for t in texts_to_score:
         if not t:
             continue
-        scored = score_text_against_patterns(t)
-        for sc in scored:
-            # 検出confを微小にブースト（上げすぎない）
+        for sc in score_text_against_patterns(t):
             det_boost = 0.0
             for d in all_detections:
                 if d.text == t or t in d.text:
                     det_boost = max(det_boost, float(d.confidence) * 0.15)
-            agg[sc.class_name] = max(
-                agg[sc.class_name],
-                min(1.0, float(sc.score) + det_boost)
-            )
+            agg[sc.class_name] = max(agg[sc.class_name], min(1.0, float(sc.score) + det_boost))
 
     best_class: Optional[str] = None
     best_score: float = 0.0
@@ -455,15 +408,85 @@ def recognize_from_image(
         if best_score <= 0:
             best_class = None
 
-    return OCRResult(
-        available=True,
-        error=None,
-        detections=all_detections,
-        class_scores=agg,
-        best_class=best_class,
-        best_score=best_score,
-        combined_text=combined,
-    )
+    return OCRResult(True, None, all_detections, agg, best_class, best_score, combined)
+
+
+def _ocr_result_rank_key(res: OCRResult) -> Tuple[int, float, int]:
+    """
+    OCR結果の優劣を比較するキー（大きいほど良い）。
+    1) best_score があるか（best_classの有無）
+    2) best_score
+    3) detections数
+    """
+    has_best = 1 if (res.best_class is not None and res.best_score > 0) else 0
+    return (has_best, float(res.best_score), len(res.detections))
+
+
+# -----------------------------
+# Public API: recognize_from_image (Step1: 回転スキャン)
+# -----------------------------
+def recognize_from_image(
+    pil_rgb: Image.Image,
+    reader=None,
+    mode: str = OCR_MODE,
+) -> OCRResult:
+    """1枚の画像から OCR + パターンマッチ（回転スキャン対応）。"""
+    ok, msg = ocr_dependencies_ok()
+    if not ok:
+        return OCRResult(False, msg, [], {}, None, 0.0, "")
+
+    if pil_rgb is None:
+        return OCRResult(False, "入力画像がNoneです", [], {}, None, 0.0, "")
+
+    if reader is None:
+        try:
+            reader = get_ocr_reader()
+        except Exception as e:
+            return OCRResult(False, f"OCR Reader 初期化失敗: {e}", [], {}, None, 0.0, "")
+
+    # 1) まず 0/90/180/270 の回転で試す
+    candidates: List[OCRResult] = []
+    for deg in ROTATION_DEGREES:
+        try:
+            if deg == 0:
+                im_rot = pil_rgb
+            else:
+                im_rot = pil_rgb.rotate(deg, expand=True)
+            res = _recognize_single_orientation(im_rot, reader=reader, mode=mode)
+            # どの回転か分かるよう variant にタグを付ける（軽量）
+            if res.detections:
+                for d in res.detections:
+                    d.variant = f"rot{deg}/" + d.variant
+            candidates.append(res)
+        except Exception:
+            continue
+
+    if candidates:
+        best = max(candidates, key=_ocr_result_rank_key)
+    else:
+        best = OCRResult(True, None, [], {}, None, 0.0, "")
+
+    # 2) 90°刻みで「検出ゼロ」なら、微調整角（±15°）を追加で試す（軽量）
+    if len(best.detections) == 0 and mode == "fast":
+        tilt_candidates: List[OCRResult] = []
+        for deg in ROTATION_DEGREES:
+            base_rot = pil_rgb if deg == 0 else pil_rgb.rotate(deg, expand=True)
+            for tilt in FALLBACK_SMALL_TILTS:
+                try:
+                    im_tilt = base_rot.rotate(tilt, expand=True)
+                    res = _recognize_single_orientation(im_tilt, reader=reader, mode=mode)
+                    if res.detections:
+                        for d in res.detections:
+                            d.variant = f"rot{deg}_tilt{tilt}/" + d.variant
+                    tilt_candidates.append(res)
+                except Exception:
+                    continue
+        if tilt_candidates:
+            best2 = max(tilt_candidates, key=_ocr_result_rank_key)
+            if _ocr_result_rank_key(best2) > _ocr_result_rank_key(best):
+                best = best2
+
+    return best
 
 
 # -----------------------------
@@ -484,18 +507,8 @@ def fuse_cnn_and_ocr(
     ocr_text = ocr.combined_text or ""
 
     if (not ocr.available) or (ocr_label is None):
-        return FusedPrediction(
-            label=cnn_label,
-            confidence=cnn_conf,
-            method="cnn",
-            cnn_label=cnn_label,
-            cnn_conf=cnn_conf,
-            ocr_label=None,
-            ocr_conf=0.0,
-            ocr_text=ocr_text,
-        )
+        return FusedPrediction(cnn_label, cnn_conf, "cnn", cnn_label, cnn_conf, None, 0.0, ocr_text)
 
-    # OCRが十分強い場合：OCR優先（一致ならブースト）
     if ocr_conf >= OCR_OVERRIDE_THRESHOLD:
         if ocr_label == cnn_label:
             conf = min(1.0, max(cnn_conf, ocr_conf) + FUSION_AGREE_BOOST)
@@ -503,64 +516,16 @@ def fuse_cnn_and_ocr(
         else:
             conf = ocr_conf
             method = "fusion_ocr"
-        return FusedPrediction(
-            label=ocr_label,
-            confidence=conf,
-            method=method,
-            cnn_label=cnn_label,
-            cnn_conf=cnn_conf,
-            ocr_label=ocr_label,
-            ocr_conf=ocr_conf,
-            ocr_text=ocr_text,
-        )
+        return FusedPrediction(ocr_label, conf, method, cnn_label, cnn_conf, ocr_label, ocr_conf, ocr_text)
 
-    # OCRとCNNが一致＆OCRがそこそこ：弱融合
     if ocr_label == cnn_label and ocr_conf >= 0.4:
         conf = min(1.0, cnn_conf + ocr_conf * 0.25)
-        return FusedPrediction(
-            label=cnn_label,
-            confidence=conf,
-            method="fusion_agree",
-            cnn_label=cnn_label,
-            cnn_conf=cnn_conf,
-            ocr_label=ocr_label,
-            ocr_conf=ocr_conf,
-            ocr_text=ocr_text,
-        )
+        return FusedPrediction(cnn_label, conf, "fusion_agree", cnn_label, cnn_conf, ocr_label, ocr_conf, ocr_text)
 
-    # CNNが強くOCRが弱い：CNN優先
     if cnn_conf >= 0.55 and ocr_label != cnn_label and ocr_conf < 0.55:
-        return FusedPrediction(
-            label=cnn_label,
-            confidence=cnn_conf,
-            method="fusion_cnn",
-            cnn_label=cnn_label,
-            cnn_conf=cnn_conf,
-            ocr_label=ocr_label,
-            ocr_conf=ocr_conf,
-            ocr_text=ocr_text,
-        )
+        return FusedPrediction(cnn_label, cnn_conf, "fusion_cnn", cnn_label, cnn_conf, ocr_label, ocr_conf, ocr_text)
 
-    # OCRがCNNより強い：OCR優先
     if ocr_conf > cnn_conf and ocr_conf >= 0.5:
-        return FusedPrediction(
-            label=ocr_label,
-            confidence=ocr_conf,
-            method="fusion_ocr",
-            cnn_label=cnn_label,
-            cnn_conf=cnn_conf,
-            ocr_label=ocr_label,
-            ocr_conf=ocr_conf,
-            ocr_text=ocr_text,
-        )
+        return FusedPrediction(ocr_label, ocr_conf, "fusion_ocr", cnn_label, cnn_conf, ocr_label, ocr_conf, ocr_text)
 
-    return FusedPrediction(
-        label=cnn_label,
-        confidence=cnn_conf,
-        method="cnn",
-        cnn_label=cnn_label,
-        cnn_conf=cnn_conf,
-        ocr_label=ocr_label,
-        ocr_conf=ocr_conf,
-        ocr_text=ocr_text,
-    )
+    return FusedPrediction(cnn_label, cnn_conf, "cnn", cnn_label, cnn_conf, ocr_label, ocr_conf, ocr_text)
