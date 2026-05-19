@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""撮影ガイド用：枠描画・テンプレート・撮影例画像の取得"""
+"""撮影ガイド用：枠描画・撮影ヒント"""
 
 from __future__ import annotations
 
@@ -8,14 +8,10 @@ from typing import List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-# OCR の center クロップと同じ比率（ocr_engine fast モード）
+# OCR の center クロップと同じ比率
 GUIDE_BOX = (0.12, 0.12, 0.88, 0.88)
 
 APP_ROOT = Path(__file__).resolve().parent
-EXAMPLE_DIRS = [
-    APP_ROOT / "assets" / "examples",
-    APP_ROOT / "dataset" / "original",
-]
 
 SHOOTING_TIPS = [
     "クランクアームの **刻印（R7100 / R8100 / R9200）** が枠の中央に入るように近づけて撮影",
@@ -81,132 +77,62 @@ def draw_guide_overlay(
     return im
 
 
-def make_viewfinder_template(width: int = 360, height: int = 480) -> Image.Image:
-    """カメラ起動前に表示するビューファインダー風テンプレート。"""
-    im = Image.new("RGB", (width, height), (28, 32, 38))
-    draw = ImageDraw.Draw(im)
-    x1, y1, x2, y2 = _box_pixels(width, height)
-
-    draw.rectangle([0, 0, width, y1], fill=(18, 20, 24))
-    draw.rectangle([0, y2, width, height], fill=(18, 20, 24))
-    draw.rectangle([0, y1, x1, y2], fill=(18, 20, 24))
-    draw.rectangle([x2, y1, width, y2], fill=(18, 20, 24))
-
-    green = (46, 204, 113)
-    cl = max(20, width // 10)
-    lw = 3
-    for (ax, ay, dx, dy) in [
-        (x1, y1, 1, 1),
-        (x2, y1, -1, 1),
-        (x1, y2, 1, -1),
-        (x2, y2, -1, -1),
-    ]:
-        draw.line([(ax, ay), (ax + dx * cl, ay)], fill=green, width=lw)
-        draw.line([(ax, ay), (ax, ay + dy * cl)], fill=green, width=lw)
-
-    draw.rectangle([x1, y1, x2, y2], outline=green, width=1)
-
-    try:
-        font_lg = ImageFont.truetype("arial.ttf", 15)
-        font_sm = ImageFont.truetype("arial.ttf", 12)
-    except OSError:
-        font_lg = font_sm = ImageFont.load_default()
-
-    draw.text((width // 2 - 70, y1 - 22), "刻印・型番", fill=green, font=font_lg)
-    draw.text((12, height - 52), "R7100 / R8100 / R9200", fill=(200, 200, 200), font=font_sm)
-    draw.text((12, height - 32), "SHIMANO ロゴ", fill=(160, 160, 160), font=font_sm)
-    return im
-
-
-def _pick_example_path(class_dir: str) -> Optional[Path]:
-    for root in EXAMPLE_DIRS:
-        folder = root / class_dir
-        if not folder.is_dir():
-            continue
-        for name in (f"{class_dir}.jpg", f"FCR{class_dir[-4:]}.jpg"):
-            p = folder / name
-            if p.is_file():
-                return p
-        for pattern in ("*.jpg", "*.jpeg", "*.png"):
-            found = sorted(folder.glob(pattern))
-            if found:
-                return found[0]
-    return None
-
-
 def get_shooting_examples() -> List[dict]:
+    """撮影例リストを返す"""
+    example_dirs = [
+        APP_ROOT / "assets" / "examples",
+        APP_ROOT / "dataset" / "original",
+        APP_ROOT,
+    ]
     meta = [
-        ("FCR7100", "105 FC-R7100", "アーム外側の型番刻印を大きく"),
-        ("FCR8100", "ULTEGRA FC-R8100", "文字が読める距離・角度"),
-        ("FCR9200", "DURA-ACE FC-R9200", "逆光を避け、側面から光を当てる"),
+        ("FCR7100", "FC-R7100（105）",         "アーム外側の型番刻印を大きく"),
+        ("FCR8100", "FC-R8100（ULTEGRA）",     "文字が読める距離・角度"),
+        ("FCR9200", "FC-R9200（DURA-ACE）",    "逆光を避け、側面から光を当てる"),
     ]
-    return [
-        {
-            "class": cls,
-            "product": product,
-            "tip": tip,
-            "path": _pick_example_path(cls),
-        }
-        for cls, product, tip in meta
-    ]
+    results = []
+    for cls, product, tip in meta:
+        path = None
+        # good_FCRxxxx.jpg をトップレベルから探す
+        for root in [APP_ROOT]:
+            p = root / f"good_{cls}.jpg"
+            if p.is_file():
+                path = p
+                break
+        # dataset/original/FCRxxxx/ から探す
+        if path is None:
+            for root in example_dirs:
+                folder = root / cls
+                if folder.is_dir():
+                    for pat in ("*.jpg", "*.jpeg", "*.png"):
+                        found = sorted(folder.glob(pat))
+                        if found:
+                            path = found[0]
+                            break
+                if path:
+                    break
+        results.append({"class": cls, "product": product, "tip": tip, "path": path})
+    return results
 
 
 def guide_overlay_html() -> str:
-    """カメラ直上に表示する CSS ガイド。"""
-    l, t, r, b = GUIDE_BOX
-    wl, wt = l * 100, t * 100
-    ww, wh = (r - l) * 100, (b - t) * 100
-    bottom_pct = (1.0 - b) * 100
-    right_pct = (1.0 - r) * 100
+    """撮影のコツを HTML で返す"""
+    tips_html = "".join(
+        f"<li style='margin-bottom:6px'>{tip}</li>"
+        for tip in SHOOTING_TIPS
+    )
     return f"""
-<style>
-  .cam-guide-wrap {{
-    max-width: 420px;
-    margin: 0 auto 0.5rem auto;
-    position: relative;
-    aspect-ratio: 3/4;
-    background: #1a1d21;
-    border-radius: 12px;
-    overflow: hidden;
-  }}
-  .cam-guide-wrap .dim {{ position: absolute; background: rgba(0,0,0,0.55); }}
-  .cam-guide-wrap .d-top {{ left:0; right:0; top:0; height:{wt}%; }}
-  .cam-guide-wrap .d-bottom {{ left:0; right:0; bottom:0; height:{bottom_pct}%; }}
-  .cam-guide-wrap .d-left {{ left:0; top:{wt}%; width:{wl}%; height:{wh}%; }}
-  .cam-guide-wrap .d-right {{ right:0; top:{wt}%; width:{right_pct}%; height:{wh}%; }}
-  .cam-guide-frame {{
-    position: absolute;
-    left: {wl}%; top: {wt}%;
-    width: {ww}%; height: {wh}%;
-    border: 2px dashed #2ecc71;
-    box-sizing: border-box;
-    border-radius: 6px;
-  }}
-  .cam-guide-label {{
-    position: absolute;
-    left: 50%; top: calc({wt}% - 1.6rem);
-    transform: translateX(-50%);
-    color: #2ecc71;
-    font-size: 0.85rem;
-    font-weight: 600;
-    text-shadow: 0 1px 3px #000;
-  }}
-  .cam-guide-hint {{
-    position: absolute;
-    bottom: 8px;
-    left: 0; right: 0;
-    text-align: center;
-    color: #bbb;
-    font-size: 0.75rem;
-  }}
-</style>
-<div class="cam-guide-wrap">
-  <div class="dim d-top"></div>
-  <div class="dim d-bottom"></div>
-  <div class="dim d-left"></div>
-  <div class="dim d-right"></div>
-  <div class="cam-guide-frame"></div>
-  <div class="cam-guide-label">刻印をここに合わせる</div>
-  <div class="cam-guide-hint">下のカメラで撮影 → 枠内に R7100 等が写ると精度UP</div>
+<div style="
+    background: #1a2a1a;
+    border: 1px solid #2ecc71;
+    border-radius: 8px;
+    padding: 14px 18px;
+    font-size: 13px;
+    color: #cccccc;
+    line-height: 1.6;
+">
+  <p style="color:#2ecc71; font-weight:bold; margin:0 0 8px">📷 撮影のコツ</p>
+  <ul style="margin:0; padding-left:18px">
+    {tips_html}
+  </ul>
 </div>
 """
