@@ -405,6 +405,15 @@ def recognize_from_image(
 
     # crop数を制限（fast: full+center だけ、thorough: +lower）
     crops = _spatial_crops(base, mode=mode)
+# ★追加：raw（加工前）を allowlist なしで一度OCRに通す
+    # カタログ画像や太字文字、反射で二値化が壊れるケースの救済
+    try:
+        raw_rgb = np.array(base)  # base は既にRGB & 縮小済み
+        all_detections.extend(
+            _run_easyocr_on_variant(reader, raw_rgb, "raw/original", allowlist=None)
+        )
+    except Exception:
+        pass
 
     # variant数も制限（max 4）
     for cname, crop in crops:
@@ -412,10 +421,18 @@ def recognize_from_image(
         for vname, arr in variants:
             tag = f"{cname}/{vname}"
             # otsu_invのみ allowlist を付けて精度を稼ぐ（負荷も増えない）
-            if vname == "otsu_inv":
-                all_detections.extend(_run_easyocr_on_variant(reader, arr, tag + "+alnum", allowlist=allowlist))
+        if vname == "otsu_inv":
+                all_detections.extend(
+                    _run_easyocr_on_variant(reader, arr, tag + "+alnum", allowlist=allowlist)
+                )
+            elif cname == "full" and vname == "original":
+                # ★追加：full/original は allowlist なし（太字や記号混じり救済）
+                all_detections.extend(
+                    _run_easyocr_on_variant(reader, arr, tag + "+raw", allowlist=None)
+                )
             else:
                 all_detections.extend(_run_easyocr_on_variant(reader, arr, tag))
+``
 
         # 安全：検出が大量なら打ち切り（メモリ/時間対策）
         if len(all_detections) > 80:
