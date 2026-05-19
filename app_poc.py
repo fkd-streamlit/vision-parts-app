@@ -282,7 +282,6 @@ st.markdown("---")
     run_ocr_button = False
     if use_ocr and ocr_ok and ocr_policy == "手動（ボタンを押したときだけ）":
         run_ocr_button = st.button("OCRを実行（初回はモデルDL）", type="primary")
-``
 
 # --- モデルパス決定 ---
 tmp_model_path: Optional[str] = None
