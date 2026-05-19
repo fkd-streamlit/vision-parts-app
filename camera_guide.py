@@ -132,23 +132,28 @@ def _pick_example_path(class_dir: str) -> Optional[Path]:
             if found:
                 return found[0]
     return None
-
-
+    
 def get_shooting_examples() -> List[dict]:
     meta = [
-        ("FCR7100", "105 FC-R7100", "アーム外側の型番刻印を大きく"),
-        ("FCR8100", "ULTEGRA FC-R8100", "文字が読める距離・角度"),
-        ("FCR9200", "DURA-ACE FC-R9200", "逆光を避け、側面から光を当てる"),
+        ("FCR7100", "105 FC-R7100",        "アーム外側の型番刻印を大きく"),
+        ("FCR8100", "ULTEGRA FC-R8100",    "文字が読める距離・角度"),
+        ("FCR9200", "DURA-ACE FC-R9200",   "逆光を避け、側面から光を当てる"),
     ]
-    return [
-        {
-            "class": cls,
+    results = []
+    for cls, product, tip in meta:
+        # トップレベルの good_FCRxxxx.jpg を優先して探す
+        path = APP_ROOT / f"good_{cls}.jpg"
+        if not path.is_file():
+            path = _pick_example_path(cls)
+        results.append({
+            "class":   cls,
             "product": product,
-            "tip": tip,
-            "path": _pick_example_path(cls),
-        }
-        for cls, product, tip in meta
-    ]
+            "tip":     tip,
+            "path":    path,
+        })
+    return results
+
+
 
 
 def guide_overlay_html() -> str:
