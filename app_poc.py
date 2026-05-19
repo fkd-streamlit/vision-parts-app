@@ -235,7 +235,7 @@ with st.sidebar:
         help="大きいほど精度は上がりやすいが、負荷も増えます。Cloudで落ちるなら 768/640 を推奨。"
     )
 
-    st.markdown("---")
+st.markdown("---")
     st.header("OCR（刻印読取）")
 
     # ★重要：デフォルトOFF（自動初期化を避ける）
@@ -244,6 +244,19 @@ with st.sidebar:
         value=False,
         help="初回は検出/認識モデルのDLが走り、Cloudでは落ちることがあります。必要時のみ有効化してください。",
     )
+
+    # ★ここに挿入（OCR対象の選択）
+    if use_ocr:
+        ocr_target = st.selectbox(
+            "OCR対象（おすすめ：刻印優先）",
+            ["刻印優先（STAMP）", "全体文字（GENERAL）"],
+            index=0,
+            help="刻印優先は背景文字を拾いにくく、型番（FC-Rxxxx/Rxxxx）に寄せます。"
+        )
+        ocr_target_key = "stamp" if "STAMP" in ocr_target else "general"
+    else:
+        # use_ocr がOFFでも変数が必ず定義されるようにしておく（事故防止）
+        ocr_target_key = "general"
 
     ocr_ok, ocr_msg = ocr_dependencies_ok()
     if use_ocr and not ocr_ok:
